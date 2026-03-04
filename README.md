@@ -1,5 +1,7 @@
 # wgpu-gltf
 
+Running example can be seen [here](https://tonis2.github.io/wgpu-gltf/web/) 
+
 C3 WebGPU bindings + glTF loader targeting **wasm32**, running in the browser. The `wgpu` library provides C3 bindings to the WebGPU API via an embedded JS bridge, and the `gltf` library parses glTF/GLB files. Together they let you build GPU-rendered 3D apps in C3 that compile to a single `.wasm` file.
 
 The included example loads a `.glb` model with textures and renders it with a simple Lambertian shader.
