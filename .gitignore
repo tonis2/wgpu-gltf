@@ -1,6 +1,7 @@
 # Prerequisites
 *.d
-
+.claude
+build
 # Object files
 *.o
 *.ko

@@ -1,0 +1,6 @@
+[submodule "lib/wgpu.c3l"]
+	path = lib/wgpu.c3l
+	url = git@github.com:tonis2/wgpu.c3l.git
+[submodule "lib/gltf.c3l"]
+	path = lib/gltf.c3l
+	url = git@github.com:tonis2/gltf.c3.git

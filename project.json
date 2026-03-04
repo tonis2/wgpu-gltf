@@ -1,0 +1,22 @@
+{
+	"langrev": "1",
+	"warnings": ["no-unused"],
+	"version": "0.1.0",
+	"dependencies": ["wgpu", "gltf"],
+	"dependency-search-paths": ["./lib"],
+	"targets": {
+		"example": {
+			"type": "executable",
+			"sources": ["src/main.c3"],
+			"target": "wasm32",
+			"link-libc": false,
+			"reloc": "none",
+			"debug-info": "none",
+			"no-entry": true,
+			"output": "web",
+			"link-args": ["--initial-memory=268435456", "--export=__heap_base", "-z", "stack-size=8388608"],
+			"panic-msg": false
+		}
+	},
+	"output": "./build"
+}
