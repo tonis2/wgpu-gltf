@@ -77,7 +77,7 @@ async function main() {
     // Fetch WASM and GLB in parallel
     const [wasmBytes, glbResponse] = await Promise.all([
         fetch('example.wasm').then(r => r.arrayBuffer()),
-        fetch('hornet.glb'),
+        fetch('model.glb'),
     ]);
 
     // Extract JS bridge from the WASM binary, then create the real bridge
