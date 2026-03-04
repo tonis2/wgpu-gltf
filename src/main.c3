@@ -9,8 +9,10 @@ import std::core::dstring;
 import wgpu;
 import gltf;
 
-// JS debug bridge
-extern fn void console_log_int(int value) @cname("console_log_int");
+// JS image bridge (decoded images provided by main.js before WASM init)
+extern fn uint js_get_image_count() @cname("js_get_image_count");
+extern fn void js_get_image_info(uint index, uint* out_ptr) @cname("js_get_image_info");
+extern fn void js_copy_image_to_texture(uint index, wgpu::Texture texture) @cname("js_copy_image_to_texture");
 
 // Provide missing compiler-rt intrinsic for wasm32 (128-bit overflow multiply)
 fn int128 __muloti4(int128 a, int128 b, int* overflow) @export("__muloti4") {
@@ -34,14 +36,18 @@ struct Uniforms {
     model: mat4x4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var base_texture: texture_2d<f32>;
+@group(0) @binding(2) var base_sampler: sampler;
 
 struct VertexIn {
     @location(0) pos:    vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) uv:     vec2<f32>,
 }
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0)       world_normal: vec3<f32>,
+    @location(1)       uv: vec2<f32>,
 }
 
 @vertex
@@ -49,6 +55,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     var out: VertexOut;
     out.clip_pos = uniforms.mvp * vec4<f32>(in.pos, 1.0);
     out.world_normal = (uniforms.model * vec4<f32>(in.normal, 0.0)).xyz;
+    out.uv = in.uv;
     return out;
 }
 
@@ -59,8 +66,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let ndotl = max(dot(n, light_dir), 0.0);
     let ambient = 0.15;
     let diffuse = ndotl * 0.85;
-    let color = vec3<f32>(0.8, 0.75, 0.7) * (ambient + diffuse);
-    return vec4<f32>(color, 1.0);
+    let tex_color = textureSample(base_texture, base_sampler, in.uv);
+    let color = tex_color.rgb * (ambient + diffuse);
+    return vec4<f32>(color, tex_color.a);
 }
 `;
 
@@ -68,10 +76,12 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // Interleaved vertex: position + normal
 // ----------------------------------------------------------------
 alias Vec3f = float[<3>];
+alias Vec2f = float[<2>];
 
 struct Vertex {
     Vec3f position;
     Vec3f normal;
+    Vec2f texcoord;
 }
 
 alias Mat4 = math::Matrix4f;
@@ -90,6 +100,9 @@ struct State {
     RenderPipeline pipeline;
     wgpu::Texture  depth_texture;
     TextureView  depth_view;
+    wgpu::Texture  color_texture;
+    TextureView  color_view;
+    wgpu::Sampler  color_sampler;
     Mat4         proj;
     Mat4         view;
     float        angle;
@@ -111,7 +124,6 @@ fn void init(
     uint canvas_width, uint canvas_height, uint surf_format_uint,
     char* glb_data, uint glb_size
 ) @export("init") {
-    console_log_int(1);
     TextureFormat surf_format = (TextureFormat)surf_format_uint;
 
     // Parse GLB from memory (arena allocator works around C3 wasm32 heap codegen bug)
@@ -120,8 +132,6 @@ fn void init(
     io::ByteReader reader;
     reader.init(glb_data[0..glb_size]);
     gltf::Gltf model = gltf::parse(&reader, &json_arena)!!;
-    console_log_int(2); // GLB parsed OK
-
     init_renderer(canvas_width, canvas_height, surf_format, model);
 }
 
@@ -144,6 +154,14 @@ fn void init_renderer(
         normal_accessor = model.accessors[normal_attr!!];
     }
 
+    // Texcoord accessor (optional)
+    usz? texcoord_attr = primitive.attributes["TEXCOORD_0"];
+    bool has_texcoords = @ok(texcoord_attr);
+    gltf::Accessor texcoord_accessor;
+    if (has_texcoords) {
+        texcoord_accessor = model.accessors[texcoord_attr!!];
+    }
+
     // Build interleaved vertex array
     uint vertex_count = pos_accessor.count;
     Vertex[] vertices = mem::new_array(Vertex, vertex_count);
@@ -154,9 +172,12 @@ fn void init_renderer(
         } else {
             vertices[i].normal = { 0.0, 1.0, 0.0 };
         }
+        if (has_texcoords) {
+            vertices[i].texcoord = model.@cast_buffer(texcoord_accessor, i, Vec2f);
+        } else {
+            vertices[i].texcoord = { 0.0, 0.0 };
+        }
     }
-    console_log_int(3); // vertices OK
-
     // Extract index data
     gltf::BufferView index_view = model.bufferViews[index_accessor.view];
     gltf::Buffer index_buffer_data = model.buffers[index_view.buffer];
@@ -171,8 +192,6 @@ fn void init_renderer(
         idx_format = wgpu::INDEX_FORMAT_UINT32;
     }
     uint index_count = index_accessor.count;
-    console_log_int(4); // indices OK
-
     // Bounding box for camera placement
     Vec3f bb_min = pos_accessor.min.xyz;
     Vec3f bb_max = pos_accessor.max.xyz;
@@ -231,8 +250,6 @@ fn void init_renderer(
         .present_mode = wgpu::PRESENT_MODE_FIFO,
     };
     wgpu::surfaceConfigure(surface, &surf_config);
-    console_log_int(5); // surface OK
-
     // Vertex buffer
     usz vb_size = vertex_count * Vertex.sizeof;
     GpuBuffer vb = wgpu::gpu_buffer(device, wgpu::BUFFER_USAGE_VERTEX | wgpu::BUFFER_USAGE_COPY_DST, vb_size);
@@ -256,23 +273,98 @@ fn void init_renderer(
     };
     wgpu::Texture depth_texture = wgpu::deviceCreateTexture(device, &depth_tex_desc);
     TextureView depth_view = wgpu::textureCreateView(depth_texture, null);
-    console_log_int(6); // depth OK
+    // --- Base color texture ---
+    // Find material's base color image index
+    int image_index = -1;
+    usz? mat_attr = primitive.attributes["material"];
+    if (@ok(mat_attr)) {
+        gltf::Material mat = model.materials[mat_attr!!];
+        if (mat.baseColorTexture.source > -1) {
+            image_index = mat.baseColorTexture.source;
+        }
+    }
 
-    // Bind group layout
-    BufferBindingLayout buf_binding = {
-        .type              = wgpu::BUFFER_BINDING_TYPE_UNIFORM,
-        .has_dynamic_offset = 0,
-        .min_binding_size  = 128,
+    wgpu::Texture color_texture;
+    TextureView color_view;
+    uint image_count = js_get_image_count();
+    if (image_index >= 0 && (uint)image_index < image_count) {
+        // Get decoded image dimensions from JS
+        uint[2] img_info;
+        js_get_image_info((uint)image_index, &img_info);
+        uint img_w = img_info[0];
+        uint img_h = img_info[1];
+        // Create GPU texture
+        TextureDescriptor color_tex_desc = {
+            .usage     = wgpu::TEXTURE_USAGE_TEXTURE_BINDING | wgpu::TEXTURE_USAGE_COPY_DST,
+            .dimension = wgpu::TEXTURE_DIMENSION_2D,
+            .size      = { .width = img_w, .height = img_h, .depth_or_array_layers = 1 },
+            .format    = wgpu::TEXTURE_FORMAT_RGBA8_UNORM,
+            .mip_level_count = 1,
+            .sample_count    = 1,
+        };
+        color_texture = wgpu::deviceCreateTexture(device, &color_tex_desc);
+
+        // Upload decoded RGBA pixels from JS directly to GPU texture
+        js_copy_image_to_texture((uint)image_index, color_texture);
+        color_view = wgpu::textureCreateView(color_texture, null);
+    } else {
+        // Fallback: 1x1 white pixel texture
+        TextureDescriptor white_tex_desc = {
+            .usage     = wgpu::TEXTURE_USAGE_TEXTURE_BINDING | wgpu::TEXTURE_USAGE_COPY_DST,
+            .dimension = wgpu::TEXTURE_DIMENSION_2D,
+            .size      = { .width = 1, .height = 1, .depth_or_array_layers = 1 },
+            .format    = wgpu::TEXTURE_FORMAT_RGBA8_UNORM,
+            .mip_level_count = 1,
+            .sample_count    = 1,
+        };
+        color_texture = wgpu::deviceCreateTexture(device, &white_tex_desc);
+        char[4] white_pixel = { '\xFF', '\xFF', '\xFF', '\xFF' };
+        TexelCopyTextureInfo dest = { .texture = color_texture };
+        TexelCopyBufferLayout layout = { .bytes_per_row = 4, .rows_per_image = 1 };
+        Extent3D write_size = { .width = 1, .height = 1, .depth_or_array_layers = 1 };
+        wgpu::queueWriteTexture(queue, &dest, &white_pixel, 4, &layout, &write_size);
+        color_view = wgpu::textureCreateView(color_texture, null);
+    }
+    // Create sampler
+    SamplerDescriptor samp_desc = {
+        .address_mode_u = wgpu::ADDRESS_MODE_REPEAT,
+        .address_mode_v = wgpu::ADDRESS_MODE_REPEAT,
+        .mag_filter     = wgpu::FILTER_MODE_LINEAR,
+        .min_filter     = wgpu::FILTER_MODE_LINEAR,
+        .mipmap_filter  = wgpu::MIPMAP_FILTER_MODE_NEAREST,
     };
-    BindGroupLayoutEntry bgl_entry = {
-        .binding    = 0,
-        .visibility = wgpu::SHADER_STAGE_VERTEX | wgpu::SHADER_STAGE_FRAGMENT,
-        .buffer     = buf_binding,
+    wgpu::Sampler color_sampler = wgpu::deviceCreateSampler(device, &samp_desc);
+    // Bind group layout (3 entries: uniform buffer, texture, sampler)
+    BindGroupLayoutEntry[3] bgl_entries = {
+        {
+            .binding    = 0,
+            .visibility = wgpu::SHADER_STAGE_VERTEX | wgpu::SHADER_STAGE_FRAGMENT,
+            .buffer     = {
+                .type              = wgpu::BUFFER_BINDING_TYPE_UNIFORM,
+                .has_dynamic_offset = 0,
+                .min_binding_size  = 128,
+            },
+        },
+        {
+            .binding    = 1,
+            .visibility = wgpu::SHADER_STAGE_FRAGMENT,
+            .texture    = {
+                .sample_type    = wgpu::TEXTURE_SAMPLE_TYPE_FLOAT,
+                .view_dimension = wgpu::TEXTURE_VIEW_DIMENSION_2D,
+            },
+        },
+        {
+            .binding    = 2,
+            .visibility = wgpu::SHADER_STAGE_FRAGMENT,
+            .sampler    = {
+                .type = wgpu::SAMPLER_BINDING_TYPE_FILTERING,
+            },
+        },
     };
     BindGroupLayoutDescriptor bgl_desc = {
         .label         = wgpu::sv("BGL"),
-        .entries_count = 1,
-        .entries       = &bgl_entry,
+        .entries_count = 3,
+        .entries       = &bgl_entries,
     };
     BindGroupLayout bgl = wgpu::deviceCreateBindGroupLayout(device, &bgl_desc);
 
@@ -284,18 +376,28 @@ fn void init_renderer(
     };
     PipelineLayout pipeline_layout = wgpu::deviceCreatePipelineLayout(device, &pl_desc);
 
-    // Bind group
-    BindGroupEntry bg_entry = {
-        .binding = 0,
-        .buffer  = ub.handle,
-        .offset  = 0,
-        .size    = 128,
+    // Bind group (3 entries)
+    BindGroupEntry[3] bg_entries = {
+        {
+            .binding = 0,
+            .buffer  = ub.handle,
+            .offset  = 0,
+            .size    = 128,
+        },
+        {
+            .binding      = 1,
+            .texture_view = color_view,
+        },
+        {
+            .binding = 2,
+            .sampler = color_sampler,
+        },
     };
     BindGroupDescriptor bg_desc = {
         .label         = wgpu::sv("BG"),
         .layout        = bgl,
-        .entries_count = 1,
-        .entries       = &bg_entry,
+        .entries_count = 3,
+        .entries       = &bg_entries,
     };
     BindGroup bind_group = wgpu::deviceCreateBindGroup(device, &bg_desc);
 
@@ -311,15 +413,16 @@ fn void init_renderer(
     };
     ShaderModule shader = wgpu::deviceCreateShaderModule(device, &sm_desc);
 
-    // Vertex layout: stride=24, two float32x3 attributes
-    VertexAttribute[2] vert_attrs = {
+    // Vertex layout: stride=32, three attributes (pos, normal, texcoord)
+    VertexAttribute[3] vert_attrs = {
         { .format = wgpu::VERTEX_FORMAT_FLOAT32X3, .offset = 0,  .shader_location = 0 }, // position
         { .format = wgpu::VERTEX_FORMAT_FLOAT32X3, .offset = 12, .shader_location = 1 }, // normal
+        { .format = wgpu::VERTEX_FORMAT_FLOAT32X2, .offset = 24, .shader_location = 2 }, // texcoord
     };
     VertexBufferLayout vbl = {
         .step_mode        = wgpu::VERTEX_STEP_MODE_VERTEX,
-        .array_stride     = 24,
-        .attributes_count = 2,
+        .array_stride     = 32,
+        .attributes_count = 3,
         .attributes       = &vert_attrs,
     };
 
@@ -366,8 +469,6 @@ fn void init_renderer(
         .depth_stencil = &ds_state,
     };
     RenderPipeline pipeline = wgpu::deviceCreateRenderPipeline(device, &rp_desc);
-    console_log_int(7); // pipeline OK
-
     // Projection & view matrices
     float aspect = (float)canvas_width / (float)canvas_height;
     Mat4 proj = math::matrix4f_perspective((float)math::PI / 4.0f, aspect, 0.01f, cam_dist * 10.0f);
@@ -385,6 +486,9 @@ fn void init_renderer(
         .pipeline      = pipeline,
         .depth_texture = depth_texture,
         .depth_view    = depth_view,
+        .color_texture = color_texture,
+        .color_view    = color_view,
+        .color_sampler = color_sampler,
         .proj          = proj,
         .view          = view_mat,
         .angle         = 0.0f,
@@ -392,7 +496,6 @@ fn void init_renderer(
         .index_format  = idx_format,
     };
 
-    console_log_int(999); // init complete
 }
 
 fn void render_frame() @export("render_frame") {

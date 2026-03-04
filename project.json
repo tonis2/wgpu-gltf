@@ -16,7 +16,7 @@
 			"output": "web",
 			"link-args": ["--initial-memory=268435456", "--export=__heap_base", "-z", "stack-size=8388608"],
 			"panic-msg": false
-		}
+		},
 	},
 	"output": "./build"
 }
