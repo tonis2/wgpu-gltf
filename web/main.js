@@ -79,20 +79,11 @@ async function main() {
         fetch('example.wasm').then(r => r.arrayBuffer()),
         fetch('hornet.glb'),
     ]);
-    if (!glbResponse.ok) {
-        document.body.innerHTML = '<h2>Failed to load hornet.glb</h2>';
-        return;
-    }
-    const glbBytes = new Uint8Array(await glbResponse.arrayBuffer());
 
     // Extract JS bridge from the WASM binary, then create the real bridge
     const createBridge = await loadBridge(wasmBytes);
     const bridge = createBridge();
     bridge.setPreInitialized(adapter, device, queue, context, canvasFormat);
-
-    // Decode embedded GLB images before WASM init
-    const decodedImages = await decodeGLBImages(glbBytes);
-    bridge.setDecodedImages(decodedImages);
 
     const FORMAT_MAP = {
         'rgba8unorm': 22, 'rgba8unorm-srgb': 23,
@@ -109,9 +100,33 @@ async function main() {
         instance.exports._initialize();
     }
 
-    const glbPtr = instance.exports.alloc(glbBytes.length);
-    new Uint8Array(instance.exports.memory.buffer).set(glbBytes, glbPtr);
-    instance.exports.init(CANVAS_WIDTH, CANVAS_HEIGHT, formatInt, glbPtr, glbBytes.length);
+    // Init renderer (once)
+    instance.exports.init(CANVAS_WIDTH, CANVAS_HEIGHT, formatInt);
+
+    // Load a GLB model: decode images, copy to WASM, call load_model
+    async function loadModel(glbBytes) {
+        const decodedImages = await decodeGLBImages(glbBytes);
+        bridge.setDecodedImages(decodedImages);
+
+        const glbPtr = instance.exports.alloc(glbBytes.length);
+        new Uint8Array(instance.exports.memory.buffer).set(glbBytes, glbPtr);
+        instance.exports.load_model(glbPtr, glbBytes.length);
+        instance.exports.dealloc(glbPtr);
+    }
+
+    // Load initial model (if fetch succeeded)
+    if (glbResponse.ok) {
+        const glbBytes = new Uint8Array(await glbResponse.arrayBuffer());
+        await loadModel(glbBytes);
+    }
+
+    // File upload handler
+    document.getElementById('glb-upload').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const glbBytes = new Uint8Array(await file.arrayBuffer());
+        await loadModel(glbBytes, false);
+    });
 
     function frame() {
         instance.exports.render_frame();
