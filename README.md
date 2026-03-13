@@ -25,7 +25,3 @@ python3 -m http.server 8080 --directory web
 
 Place a `.glb` file as `web/model.glb` for the default model, or use the file upload button to load any GLB at runtime.
 
-
-## Known issues
-
-**wasm32 TempAllocator bug**: C3's default temp allocator (`tmem`) crashes with `unreachable` on the second WASM export call. Workaround: pre-allocate an `ArenaAllocator` buffer during `init()` and use `mem::@scoped(&arena)` for allocation-heavy code paths. See `src/main.c3` `load_model()` for an example.
